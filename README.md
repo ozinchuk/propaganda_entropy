@@ -62,9 +62,8 @@ Raw files (parquet/csv/tsv/jsonl/txt)
 
 ### 1. Initial class split
 
-The source `messages.csv` is split by `binary_label` into `messages_propaganda.csv` and `baseline_messages.csv`. The baseline is capped at **up to 2× the propaganda count** (`random_state=42`), not a strict 1:1 — cleaning, quality filtering, and deduplication downstream remove an uneven share of rows from each class (propaganda text tends to be more heavily syndicated/duplicated), so an exact 1:1 split here wouldn't survive to the final corpus anyway.
+The source `messages.csv` is split by `binary_label` into `messages_propaganda.csv` and `baseline_messages.csv`. The baseline is capped at **up to 4× the propaganda count** (`random_state=42`), not a strict 1:1 — cleaning, quality filtering, and deduplication downstream remove an uneven share of rows from each class (propaganda text tends to be more heavily syndicated/duplicated), so an exact 1:1 split here wouldn't survive to the final corpus anyway.
 
-> ⚠️ **Known follow-up**: this initial 1:2 cap is a coarse pre-filter, not the final balance. Before entropy is computed in Part 2/3, both cleaned classes should be re-equalized to the same final row count (`n = min(len(prop_clean), len(base_clean))`), sampled *after* all filtering/dedup — not before. Comparing entropy across unevenly sized samples confounds sample size with the linguistic signal being studied.
 
 ### 2. File discovery & prioritization
 
@@ -151,3 +150,95 @@ A deduplicated, roughly-balanced (final exact balance pending, see step 1), Ukra
   "source_file": "drive/MyDrive/files_prop/hqp_labeled.parquet"
 }
 ```
+
+## Stage 02 / 03
+
+**Week 2:** LLM Deployment, Cross-Entropy & BPC Calculation
+
+### 📌 Project context
+
+Before statistical analysis can begin in Week 3, the linguistic predictability of the cleaned text must be measured. This stage takes the standardized dataset from Week 1 and processes it through causal language models to calculate the cross-entropy, ultimately converting it into Bits Per Character (BPC).
+
+### 🧠 What it does
+
+This stage takes the cleaned corpus (`merged_dataset.csv` or `merged_dataset_split.csv`) and scores the predictability of its text using next-token prediction. Because environments vary, this step is implemented in two parallel scripts:
+
+* `Propaganda_enthropy.ipynb`: The primary pipeline for CUDA environments (Google Colab), utilizing PyTorch, Hugging Face `transformers`, and `bitsandbytes`.
+
+
+* `entropy.py`: A native Apple Silicon implementation using the `mlx` framework (`mlx_lm`) for efficient local execution.
+
+
+
+### ⚙️ Pipeline stages
+
+**Cleaned Corpus (.csv)**
+│
+▼
+**1. Sentence Explosion** (Splitting and filtering by length)
+│
+▼
+**2. Model & Tokenizer Loading** (with optional 4-bit quantization)
+│
+▼
+**3. Tokenization & Offset Mapping**
+│
+▼
+**4. Forward Pass with Context Masking** (First 70 chars ignored)
+│
+▼
+**5. Entropy → BPC Conversion**
+│
+▼
+**6. Save per-model results (.csv)**
+
+#### 1. Sentence Explosion
+
+Instead of scoring massive, multi-paragraph documents at once, the pipeline explodes the text into discrete sentence chunks. It splits the `processed` text column by terminal punctuation (`.`, `!`, `;`, `?`). To maintain consistency in the evaluation window, only sentences between 120 and 200 characters in length are retained. Each derived sentence inherits the original row's metadata and is assigned a unique UUID (`document_id`) to track its provenance.
+
+#### 2. Model & Tokenizer Loading
+
+The pipeline evaluates the text across a suite of different LLMs to ensure the entropy signals are robust across different architectures. The primary CUDA script sequentially loads:
+
+* `google/gemma-3-1b-pt`
+
+* `meta-llama/Llama-3.2-3B`
+
+* `Qwen/Qwen2.5-7B-Instruct`
+
+* `google/gemma-3-12b-pt` (in process)
+
+* `lapa-llm/lapa-12b-pt` (in process)
+
+
+To prevent OOM (Out of Memory) errors on consumer GPUs, the larger models (Qwen 7B, Gemma 12B, Lapa 12B) are automatically loaded using 4-bit NormalFloat (NF4) quantization via `BitsAndBytesConfig`. The MLX implementation targets `mlx-community/Qwen2.5-7B-Instruct-4bit` natively.
+
+#### 3. Tokenization & Offset Mapping
+
+The text is tokenized with `return_offsets_mapping=True` to keep track of exactly which characters correspond to which tokens. This is crucial for calculating character-level metrics later, as token boundaries do not align cleanly with character counts. A Beginning-Of-Sequence (BOS) token is prepended if the tokenizer supports it.
+
+#### 4. Context Masking — The 70-Character Rule
+
+Language models exhibit a known "burn-in" phase: the very first words of a sequence are inherently unpredictable because the model has zero prior context, resulting in an artificially massive loss spike.
+
+To solve this, the pipeline uses a context mask. Using the offset mappings, any token whose starting character index is less than 70 is masked out (set to `-100` in PyTorch, or multiplied by `0.0` in MLX). The model still *reads* these first 70 characters to build its internal state, but its prediction errors on these early tokens are completely excluded from the final entropy calculation.
+
+#### 5. Entropy to BPC Conversion
+
+For the valid (unmasked) tokens, the pipeline computes the Cross-Entropy loss.
+
+* The sum of the loss across valid tokens provides the total entropy in *nats*.
+
+
+* This sum is divided by the natural logarithm of 2 (`np.log(2)`) to convert the measurement from nats to *bits*.
+
+
+* Finally, the total bits are divided by the number of valid characters (total string length minus the 70-character masked prefix) to derive the **Bits Per Character (BPC)**.
+
+
+
+Using characters (instead of tokens) as the final denominator standardizes the metric, allowing fair comparisons across different models that use entirely different tokenization dictionaries.
+
+#### 6. Export
+
+The script outputs a dedicated CSV file for each evaluated model (e.g., `entropy_meta-llama_Llama-3.2-3B.csv`) containing the original metadata alongside the newly calculated `total_bits`, `valid_chars`, and `bpc` columns. GPU memory is explicitly cleared (`torch.cuda.empty_cache()`, `gc.collect()`) between model runs to ensure stability.

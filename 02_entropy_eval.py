@@ -10,22 +10,6 @@ from huggingface_hub import login
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
-def explode_into_sentences(df, text_column='processed'):
-    new_rows = []
-    for idx, row in df.iterrows():
-        original_text = str(row[text_column])
-        doc_id = str(uuid.uuid4())
-        sentences = re.split(r'[.!;?]+', original_text)
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if 120 <= len(sentence) <= 200:
-                new_row = row.copy()
-                new_row['document_id'] = doc_id
-                new_row['original_text'] = original_text
-                new_row[text_column] = sentence
-                new_rows.append(new_row)
-    return pd.DataFrame(new_rows)
-
 huggingface_token = os.environ.get('HF_TOKEN')
 login(token=huggingface_token)
 
